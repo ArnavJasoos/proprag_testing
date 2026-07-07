@@ -1,0 +1,75 @@
+# PropRAG vs GraphRAG vs BaseRAG — Local 2WikiMultiHopQA Benchmark
+
+## Context
+
+User wants to compare PropRAG (proposition beam-search RAG), GraphRAG, and base dense RAG on a certified multi-hop benchmark, measuring accuracy (EM/F1/Recall@k) and token consumption (indexing + query), fully local on a 16GB-RAM CPU-only Windows machine. Stack decided with user: **Koboldcpp @ http://localhost:5001/v1 serving gpt-oss-20b Q4_K_M** (chat), **sentence-transformers BAAI/bge-large-en-v1.5 in-process** (embeddings), **50 stratified questions of 2WikiMultiHopQA** (~400-doc corpus subset), and a **custom faithful Microsoft-style GraphRAG** built new (own extraction + Leiden communities + community reports) so its indexing cost is genuinely measured.
+
+Key research facts:
+- `C:\Users\arnav.jade\Documents\PropRAG\proprag_poc\` (existing POC, import as library — do NOT modify) already provides: Koboldcpp preset ([config.py:20](../../Documents/PropRAG/proprag_poc/config.py)), cached/retrying `LLMClient`, `EmbeddingModel`, `EmbeddingStore`, `Extractor` (NER+propositions), `GraphBuilder`, PropRAG `Retriever`, `BaseRAGRetriever`, `UsageTracker` per-scope token/latency metrics, `compute_mdhash_id`, `fix_json_messages`.
+- `C:\Users\arnav.jade\Documents\PropRAG\PropRAG-main\reproduce\dataset\2wikimultihopqa{,_corpus}.json`: 1000 Qs (compositional 413 / comparison 244 / bridge_comparison 235 / inference 108), 6119 `{title,text}` docs; every question lists 10 context titles, all present in corpus → clean subsetting (50 Qs ≈ 400 docs). Gold = `supporting_facts` titles (2/question typical). EM/F1/Recall@k port from `PropRAG-main/src/proprag/evaluation/`.
+- POC gotchas to work around (all on our side): not pip-installable (sys.path shim to parent `Documents\PropRAG`); `core/index.py` top-imports PyMuPDF/tiktoken → never import it, replicate its ~50-line `build_from_texts` body; `strip_reasoning` config flag declared but unimplemented → subclass client; `UsageTracker.scope()` is thread-local and POC `batch_extract` uses a thread pool → index-cost attribution via before/after snapshot deltas (builds sequential); `data_dir`/`.env` cwd-relative → absolute paths; POC default backend is `nvidia` → set `koboldcpp` explicitly.
+
+Full module-level design: `C:\Users\arnav.jade\.claude\plans\look-at-the-proprag-synchronous-deer-agent-aa42809f76250d5f2.md` (read it during implementation).
+
+## Project layout (new, under `PropRAG Testing/`)
+
+```
+requirements.txt   # openai, sentence-transformers, python-igraph, numpy, pandas, pyarrow, tqdm, matplotlib(opt)
+README.md          # koboldcpp launch cmd, smoke/pilot/full run instructions
+.gitignore         # data/, __pycache__/, *.sqlite
+benchmark/
+  _bootstrap.py    # sys.path.insert(0, <Documents\PropRAG>) so `import proprag_poc` works
+  bench_config.py  # BenchmarkConfig dataclass wrapping POCConfig (llm_backend="koboldcpp", abs data_dir, llm_max_workers=1, temp=0, seed)
+  llm_wrap.py      # BenchLLMClient(LLMClient): strip gpt-oss Harmony reasoning channel; check_backend() pings {base}/models
+  dataset.py       # load 2wiki, stratified 50-subset (21/12/12/5, seeded largest-remainder), corpus union, chunk_id→title map, manifest.json
+  proprag_adapter.py # BenchCorpus duck-type (Retriever needs only 6 attrs); build shared chunk store (BaseRAG phase); replicate build_from_texts (PropRAG phase); load paths
+  graphrag/
+    prompts.py     # JSON extraction / description-summary / community-report prompts (small-model friendly, one worked example)
+    extract.py     # per-chunk typed entity+relationship extraction; merge; multi-tier JSON repair (json_mode → lenient parse → fix_json call → regex salvage → counted skip); workers set tracker.scope("index::GraphRAG")
+    communities.py # igraph community_leiden(modularity, weighted) — no leidenalg dep; LLM community reports (size≥2, ~12k char context cap)
+    index.py       # GraphRAGIndex build/persist/load: extraction.json checkpoint, entities/relationships/communities/reports.json, graph.graphml, gr_entity EmbeddingStore ("name: description"); reuses SHARED chunk_store
+    search.py      # GraphRAGLocalRetriever: query-embedding→entity match (sim floor 0.5, top 10), chunk scoring = entity/relationship provenance + 0.5·dense blend, dense fallback; build_qa_context() = community reports + relationship lines + chunks within same qa_top_k budget
+  qa.py            # single shared QA prompt for all 3 systems: brief reasoning then `Answer: <shortest span>`; extraction of final answer
+  evaluation.py    # normalize_answer/EM/F1 (ported verbatim from PropRAG-main eval_utils/qa_eval), recall_at_k(gold_titles, retrieved_titles, ks=(2,5,10))
+  usage.py         # Snapshot delta helpers + IndexPhase context manager (captures "index" scope delta + own scope + wall time)
+  results.py       # ResultsStore: append-only results.jsonl + fsync, done_keys() for resume, run_meta.json subset-hash guard
+  report.py        # metrics.json + report.md: per-system EM/F1/R@2/5/10, per-question-type breakdown, index tokens (prompt/completion) per system, query tokens/question, latencies, parse-failure counts, fairness footer; optional matplotlib bar charts
+  smoke.py         # 4 tiny docs + 2 questions through full pipeline; asserts JSON parse, Answer: extraction, 3 index_usage entries, report written
+  run.py           # CLI: python -m benchmark.run [--pilot 10] [--questions 50] [--seed 42] [--systems ...] [--force-reindex] [--report-only]
+data/              # runtime: caches, corpora/<id>/, benchmark/<run_id>/
+```
+
+## Flow (run.py)
+
+1. Bootstrap, logging (reuse `proprag_poc.logging_setup`), `check_backend()` (fail fast with koboldcpp launch hint: `koboldcpp.exe --model gpt-oss-20b-Q4_K_M.gguf --port 5001 --contextsize 8192`).
+2. Stratified subset → manifest → corpus docs (1 doc = 1 chunk, `f"{title}\n{text}"`).
+3. Three sequential index phases, each in `IndexPhase`, skipped when artifacts exist:
+   a. shared chunk embeddings → BaseRAG cost; b. POC Extractor + GraphBuilder → PropRAG cost; c. GraphRAG extract+summarize+communities+reports → GraphRAG cost. Write `index_usage.json`.
+4. Per-question loop (resume-safe via results.jsonl): for each system — `tracker.scope("q::<system>")`, time retrieve → Recall@k via chunk_id→title; time QA (GraphRAG uses `build_qa_context`); EM/F1; append row (incl. raw answer for re-scoring). Per-system try/except so one failure doesn't kill the run (compare.py pattern).
+5. `report.build()`; pilot mode additionally prints measured s/call + projected full-run wall time.
+
+Token attribution: BaseRAG/PropRAG index = "index"-scope snapshot deltas around their sequential phases; GraphRAG index = explicit scope inside its own workers; query = per-question scopes on main thread.
+
+## Implementation order
+
+1. Scaffolding (_bootstrap, bench_config, llm_wrap, requirements, README, .gitignore) — verify `import proprag_poc` works.
+2. dataset.py (+ `__main__` sanity print: type counts, corpus size ~380–420, title coverage) — no LLM needed.
+3. evaluation.py ports with inline hand-case asserts.
+4. proprag_adapter.py — verify on 2-doc toy corpus with koboldcpp up.
+5. qa.py, usage.py, results.py.
+6. graphrag/ (prompts → extract → communities → index → search); test extract on 3 real 2wiki paragraphs before batch.
+7. run.py, report.py, smoke.py.
+
+## Verification
+
+1. `python -m benchmark.dataset` — subset/corpus stats correct, all gold titles covered.
+2. Start Koboldcpp with gpt-oss-20b; `python -m benchmark.smoke` — full pipeline in a handful of calls; catches JSON failures and reasoning leakage day one.
+3. `python -m benchmark.run --pilot 10` — inspect report.md + sample answers; calibrate projected full-run time; check RAM (if paging: `PROPRAG_EMBEDDING_MODEL=BAAI/bge-base-en-v1.5` env override).
+4. `python -m benchmark.run` (full 50) — resumable at three levels (SQLite LLM cache / stage checkpoints / results.jsonl). Deliverable: `data/benchmark/<run_id>/report.md` + metrics.json + charts.
+
+## Risks
+
+- **RAM**: 20B Q4 (~11.5GB mmap) + bge-large (~1.3GB); mitigations above.
+- **Runtime**: ~1,400–1,700 chat calls on CPU 20B → potentially multi-day; pilot projects it; per-call max-token caps (extraction 1500 / reports 1000 / QA 512); every call cached so interruptions cost nothing. Index wall time itself is a reported finding.
+- **Small-model JSON**: multi-tier repair proven in POC; failure counts surfaced in report.
+- **EM sensitivity**: short-span prompt + `Answer:` extraction + normalization; raw answers preserved.
