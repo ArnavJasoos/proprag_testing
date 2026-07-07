@@ -44,7 +44,19 @@ def strip_gpt_oss_reasoning(content: str) -> str:
 
 
 class BenchLLMClient(LLMClient):
-    """``LLMClient`` that post-processes gpt-oss reasoning out of every response."""
+    """``LLMClient`` that post-processes gpt-oss reasoning out of every response.
+
+    Also disables the OpenAI ``response_format={"type":"json_object"}`` constraint:
+    gpt-oss on Koboldcpp collapses to degenerate output (e.g. an empty ``[]``) when
+    JSON grammar-constrained, because its Harmony reasoning channels cannot be
+    expressed under that grammar. We instead rely on the "respond ONLY with JSON"
+    prompts plus reasoning-strip and lenient/regex parsing downstream. ``json_mode``
+    still flows through as before, but no ``response_format`` is sent to the server.
+    """
+
+    def __init__(self, config: POCConfig):
+        super().__init__(config)
+        self._json_response_format_ok = False
 
     def infer(self, *args, **kwargs):
         content, meta, cache_hit = super().infer(*args, **kwargs)
