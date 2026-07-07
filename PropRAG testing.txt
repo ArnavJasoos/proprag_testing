@@ -1,0 +1,136 @@
+Q. I was trying PropRAG and I wanted to evaluate it and compare it to base RAG and GraphRAG on a certified evaluation benchmark to measure key metrics and token consumption tradeoffs between them.
+
+A. 
+To evaluate PropRAG (Proposition-based RAG) against Base RAG and GraphRAG, you should align your testing with the methodology used in the PropRAG paper itself. This ensures a fair "apples-to-apples" comparison using the same certified benchmarks where PropRAG claims state-of-the-art results. [1] 
+## 1. The "Certified" Benchmarks
+PropRAG is specifically designed for multi-hop reasoning (connecting dot A to dot B). Therefore, you cannot use simple single-fact datasets (like SQuAD). You must use the same "certified" multi-hop benchmarks cited in the PropRAG research: [2] 
+
+* 
+* HotpotQA (Distractor Setting): The gold standard for multi-hop reasoning. It tests if the system can find two distant facts to answer one question.
+* MuSiQue: A more complex dataset requiring up to 3-4 hops of reasoning, harder than HotpotQA.
+* 2WikiMultihopQA: Focuses on combining facts from different Wikipedia articles. [3, 4, 5, 6, 7] 
+* 
+
+## 2. The Evaluation Strategy
+You will need to run three distinct pipelines on the same subset of data (e.g., the first 500 questions from HotpotQA validation set).
+
+| Pipeline [8, 9, 10] | Core Mechanism | Critical Metric to Watch |
+|---|---|---|
+| Base RAG | Standard Chunking + Vector Search | Noise Ratio: Does it retrieve too much irrelevant text? |
+| GraphRAG | Knowledge Graph (Triples/Communities) | Indexing Cost: How many tokens did it burn to build the graph? |
+| PropRAG | Atomic Propositions + Beam Search | Path Accuracy: Did the beam search find the correct "reasoning chain"? |
+
+## 3. Step-by-Step Execution Plan## Phase 1: Setup & Indexing (Measuring "Offline" Costs)
+This is where the biggest token tradeoffs occur. You must measure Indexing Tokens.
+
+* 
+* Base RAG: Cheap. Just embeddings.
+* GraphRAG (Microsoft): Very Expensive. It uses an LLM to read every chunk and generate summaries/communities.
+* PropRAG: Moderate/High. It uses an LLM to "propositionalize" text (break complex sentences into atomic facts) offline. [11, 12, 13, 14, 15] 
+* 
+
+Action: Use a counter (like tiktoken) during the indexing phase to log Total_Indexing_Tokens.
+
+* 
+* Hypothesis: GraphRAG > PropRAG >> Base RAG.
+* 
+
+## Phase 2: Querying (Measuring "Online" Efficiency)
+This is PropRAG's main claim to fame. It uses an LLM-free beam search to find the reasoning path. [2, 16] 
+
+* 
+* Base RAG: Retrieves top-k chunks.
+* GraphRAG: May perform "Global Search" (map-reduce over communities), which is token-heavy at query time.
+* PropRAG: Searches the proposition graph algorithmically (using dot products/beam search), then sends only the perfect chain to the LLM. [17, 18, 19, 20, 21] 
+* 
+
+Action: Measure Tokens_Per_Query (Input tokens sent to the final LLM).
+
+* 
+* Hypothesis: PropRAG should have the lowest input token count because it sends a clean "chain" of facts, not giant noisy chunks.
+* 
+
+## Phase 3: Scoring (The "Certified" Metrics)
+Use the standard evaluation scripts provided by the HotpotQA/MuSiQue maintainers, or use the Ragas framework if you prefer LLM-as-a-judge. [22] 
+
+* 
+* Exact Match (EM): Did the answer match the ground truth exactly?
+* F1 Score: Overlap between generated answer and ground truth.
+* Faithfulness (Ragas): Is the answer grounded in the retrieved propositions? [23, 24] 
+* 
+
+## 4. Implementation Code (Conceptual)
+Since you are using the ReLink-Inc/PropRAG repository, you can likely leverage their existing evaluation scripts. If you need to build a custom comparison wrapper, use this structure:
+
+import timeimport tiktokenfrom ragas import evaluatefrom ragas.metrics import context_precision, answer_relevancy
+# 1. Define your three retrieversdef run_base_rag(query):
+    # Standard Vector Store retrieval
+    pass
+def run_graph_rag(query):
+    # Graph/Community search
+    pass
+def run_proprag(query):
+    # 1. Look up start node
+    # 2. Run Beam Search (LLM-free)
+    # 3. Return Proposition Chain
+    pass
+# 2. The Evaluator Loopresults = []enc = tiktoken.encoding_for_model("gpt-4")
+for q in hotpot_qa_subset:
+    # --- Measure Latency ---
+    start = time.time()
+    context = run_proprag(q['question']) 
+    latency = time.time() - start
+    
+    # --- Measure Token Economy ---
+    # PropRAG context is usually a list of short propositions
+    input_tokens = len(enc.encode(context))
+    
+    # --- Generate Answer ---
+    answer = llm.generate(q['question'], context)
+    
+    results.append({
+        "system": "PropRAG",
+        "latency": latency,
+        "input_tokens": input_tokens,
+        "contexts": [context],
+        "answer": answer,
+        "ground_truth": q['answer']
+    })
+# 3. Run Ragas Evaluation# Convert 'results' to Dataset and run evaluate()
+
+## Summary of Tradeoffs to Expect
+
+| Feature [25] | Base RAG | GraphRAG | PropRAG |
+|---|---|---|---|
+| Multi-hop Ability | 🔴 Poor | 🟢 Good (Global) | 🟢 Excellent (Local Paths) |
+| Indexing Cost | 🟢 Low | 🔴 Very High | 🟡 Medium (Proposition extraction) |
+| Query Latency | 🟢 Fast | 🔴 Slow (if Global Search) | 🟢 Fast (Beam Search is optimized) |
+| Token Consumption | 🟡 Medium (High noise) | 🔴 High (Context windows fill up) | 🟢 Low (Only relevant atomic facts) |
+
+Recommendation: If your goal is to prove PropRAG is "best," focus your evaluation on Token Efficiency per Correct Answer. Show that PropRAG achieves the same F1 score as GraphRAG but with 50-70% fewer input tokens to the final LLM.
+
+[1] [https://github.com](https://github.com/ReLink-Inc/PropRAG)
+[2] [https://arxiv.org](https://arxiv.org/abs/2504.18070)
+[3] [https://docs.agentset.ai](https://docs.agentset.ai/get-started/benchmarks)
+[4] [https://arxiv.org](https://arxiv.org/html/2507.06838v2)
+[5] [https://arxiv.org](https://arxiv.org/html/2511.18659v1)
+[6] [https://arxiv.org](https://arxiv.org/html/2501.10053v1)
+[7] [https://www.mdpi.com](https://www.mdpi.com/2079-9292/15/6/1263)
+[8] [https://bluetickconsultants.medium.com](https://bluetickconsultants.medium.com/from-rag-to-graphrag-transforming-information-retrieval-with-knowledge-graphs-010776069449)
+[9] [https://arxiv.org](https://arxiv.org/html/2503.15231v1)
+[10] [https://ai.gopubby.com](https://ai.gopubby.com/a-comprehensive-guide-to-building-accurate-and-efficient-rag-systems-d9f6f48a3f70)
+[11] [https://www.youtube.com](https://www.youtube.com/watch?v=mGqpqPBEf-8&t=15)
+[12] [https://blog.gopenai.com](https://blog.gopenai.com/lightrag-the-evolution-of-graph-based-rag-systems-df441bae4b48)
+[13] [https://arxiv.org](https://arxiv.org/html/2509.18667)
+[14] [https://levelup.gitconnected.com](https://levelup.gitconnected.com/standard-rag-vs-graphrag-a-realistic-hands-on-guide-11bd1c0cc03c)
+[15] [https://arxiv.org](https://arxiv.org/html/2603.05698v2)
+[16] [https://arxiv.org](https://arxiv.org/abs/2504.18070)
+[17] [https://orq.ai](https://orq.ai/blog/rag-architecture)
+[18] [https://medium.com](https://medium.com/graph-praxis/graphrag-vs-hipporag-vs-pathrag-vs-og-rag-choosing-the-right-architecture-for-your-knowledge-graph-a4745e8b125f)
+[19] [https://www.microsoft.com](https://www.microsoft.com/en-us/research/blog/benchmarkqed-automated-benchmarking-of-rag-systems/)
+[20] [https://arxiv.org](https://arxiv.org/pdf/2504.18070)
+[21] [https://www.researchgate.net](https://www.researchgate.net/publication/391219788_PropRAG_Guiding_Retrieval_with_Beam_Search_over_Proposition_Paths)
+[22] [https://www.mdpi.com](https://www.mdpi.com/2813-4168/4/1/6)
+[23] [https://arxiv.org](https://arxiv.org/html/2412.12322v1)
+[24] [https://arxiv.org](https://arxiv.org/html/2507.23581v1)
+[25] [https://arxiv.org](https://arxiv.org/html/2507.23581v1)
