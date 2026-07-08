@@ -18,7 +18,7 @@ only measured differences are each system's index and its retrieval strategy.
 
 | Component | Choice |
 |---|---|
-| Chat LLM | gpt-oss-20b Q4_K_M via **Koboldcpp** at `http://localhost:5001/v1` |
+| Chat LLM | `gpt-oss-20b-Q4_K_M.gguf` from Hugging Face, via Koboldcpp locally or direct `llama-cpp-python` in Colab |
 | Embeddings | `BAAI/bge-large-en-v1.5` via sentence-transformers (in-process) |
 | Graph | python-igraph (`community_leiden`, no `leidenalg`) |
 | Reused library | `../proprag_poc` (imported, never modified) |
@@ -33,7 +33,9 @@ The project imports `proprag_poc` as a library; keep this folder as a **sibling*
 pip install -r requirements.txt
 ```
 
-Start Koboldcpp (separate terminal), serving gpt-oss-20b:
+For Colab, open `PropRAG_Benchmark_Colab.ipynb` and run the cells. The notebook downloads `unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf` with an optional `HF_API_TOKEN` / `HF_TOKEN`, then uses direct `llama-cpp-python` inference without a localhost API server or load-time quantization.
+
+For local desktop runs, you can still start Koboldcpp separately:
 
 ```bash
 koboldcpp.exe --model gpt-oss-20b-Q4_K_M.gguf --port 5001 --contextsize 8192
@@ -83,7 +85,7 @@ Everything lands under `data/`:
 - ~1,400–1,700 chat calls on a CPU-served 20B → potentially long; the pilot projects
   it. Every call is cached; reruns resume at the SQLite / stage-checkpoint /
   `results.jsonl` levels.
-- ~11.5 GB for the 20B Q4 model + ~1.3 GB for bge-large. Under RAM pressure, drop the
+- ~11.6 GB for the gpt-oss-20b Q4_K_M GGUF + ~1.3 GB for bge-large. Under RAM pressure, drop the
   embedder without touching code:
 
   ```bash
@@ -97,3 +99,16 @@ GraphRAG gleanings setting (`gr_max_gleanings=0` by default; Microsoft's default
 which roughly doubles GraphRAG index cost). Recall@k is scored on retrieved documents
 for all systems; GraphRAG's QA additionally uses community reports + relationships via
 its local-search context assembly, which the report states explicitly.
+
+
+## Colab GGUF mode
+
+The generated notebook sets:
+
+```bash
+PROPRAG_LLM_BACKEND=llama_cpp
+PROPRAG_GGUF_MODEL_PATH=/content/models/gpt-oss-20b-q4_k_m/gpt-oss-20b-Q4_K_M.gguf
+PROPRAG_LLAMA_N_CTX=4096
+```
+
+Those defaults are chosen for a free Colab Tesla T4. Increase the context size only if the runtime has enough spare memory.

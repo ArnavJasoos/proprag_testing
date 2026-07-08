@@ -1,26 +1,40 @@
-"""Put the ``proprag_poc`` package on ``sys.path``.
+"""Put the proprag_poc package on sys.path.
 
-``proprag_poc`` is not pip-installable and uses package-relative imports, so it
-imports cleanly only when its PARENT directory is importable. This file lives at
-``PropRAG/PropRAG Testing/benchmark/_bootstrap.py``; ``parents[2]`` is the
-``PropRAG`` directory that holds ``proprag_poc``. Import this module first from
-every entry point.
+Locally, proprag_poc is expected next to this project under the PropRAG folder.
+In Colab, the notebook sets PROPRAG_MAIN to the cloned PropRAG repository and
+this module imports proprag_poc from there.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
-_PROPRAG_PARENT = Path(__file__).resolve().parents[2]
+_candidates = []
+_env_main = os.environ.get("PROPRAG_MAIN")
+if _env_main:
+    _candidates.append(Path(_env_main).resolve())
+
+_here = Path(__file__).resolve()
+_candidates.extend([
+    _here.parents[2],
+    Path("/content/PropRAG_main"),
+    Path("/content/PropRAG"),
+])
+
+_PROPRAG_PARENT = None
+for _cand in _candidates:
+    if (_cand / "proprag_poc" / "config.py").is_file():
+        _PROPRAG_PARENT = _cand
+        break
+
+if _PROPRAG_PARENT is None:
+    expected = ", ".join(str(p / "proprag_poc") for p in _candidates)
+    raise ImportError(
+        "proprag_poc not found. Set PROPRAG_MAIN to the cloned PropRAG "
+        f"repository. Checked: {expected}"
+    )
 
 if str(_PROPRAG_PARENT) not in sys.path:
     sys.path.insert(0, str(_PROPRAG_PARENT))
-
-# Fail loudly and early if the layout assumption is wrong.
-if not (_PROPRAG_PARENT / "proprag_poc" / "config.py").is_file():
-    raise ImportError(
-        f"proprag_poc not found next to the project. Expected it at "
-        f"{_PROPRAG_PARENT / 'proprag_poc'}. Keep 'PropRAG Testing' as a sibling "
-        f"of 'proprag_poc' under the PropRAG directory."
-    )
