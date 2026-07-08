@@ -11,13 +11,17 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Dict, List
 
 from . import _bootstrap  # noqa: F401
 from proprag_poc.config import POCConfig
+from proprag_poc.core.metrics import CallRecord, get_usage_tracker
 from proprag_poc.llm.client import LLMClient
+
+_LLAMA_CPP_MODEL_LABEL = "gpt-oss-20b-gguf"
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +57,18 @@ class BenchLLMClient(LLMClient):
     def __init__(self, config: POCConfig):
         self._direct_llama = config.llm_backend == "llama_cpp"
         if self._direct_llama:
+            # Skip LLMClient.__init__ (it would build an OpenAI HTTP client for a
+            # preset we're not using), but still wire up the SQLite response cache
+            # and UsageTracker plumbing LLMClient.infer() normally provides -
+            # otherwise every direct call would be uncached and untracked, which
+            # would silently zero out this benchmark's token-consumption numbers
+            # and break resume-on-interrupt for Colab runs.
             self.config = config
+            self._backend = "llama_cpp"
+            self._tracker = get_usage_tracker()
+            self._lock = threading.Lock()
+            self._cache_path = os.path.join(config.data_dir, "llm_cache.sqlite")
+            self._init_cache()
         else:
             super().__init__(config)
         self._json_response_format_ok = False
@@ -97,21 +112,62 @@ class BenchLLMClient(LLMClient):
             if self.config.strip_reasoning:
                 content = strip_gpt_oss_reasoning(content)
             return content, meta, cache_hit
+        return self._infer_direct(messages, *args, **kwargs)
 
-        max_tokens = kwargs.get("max_completion_tokens") or kwargs.get("max_tokens") or 512
-        temperature = kwargs.get("temperature", self.config.temperature)
+    def _infer_direct(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = None,
+        json_mode: bool = False,
+        use_cache: bool = True,
+        max_completion_tokens: int = None,
+        response_checker=None,
+    ):
+        temperature = self.config.temperature if temperature is None else temperature
+        max_tokens = max_completion_tokens or self.config.max_completion_tokens
+        # `system=None, turns=messages`: the exact split doesn't matter here, this
+        # is purely a cache-key input, and "backend" already disambiguates it from
+        # the HTTP cache path's keys.
+        key = self._cache_key(None, messages, temperature, max_tokens, json_mode)
+
+        if use_cache:
+            cached = self._cache_get(key)
+            if cached is not None:
+                self._tracker.record(
+                    CallRecord(kind="chat", model=_LLAMA_CPP_MODEL_LABEL, cache_hit=True)
+                )
+                content = strip_gpt_oss_reasoning(cached) if self.config.strip_reasoning else cached
+                return content, {"finish_reason": "cached"}, True
+
+        t0 = time.monotonic()
         with self._llama_lock:
             response = self._llama.create_chat_completion(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                seed=getattr(self.config, "seed", -1),
+                seed=self.config.seed if self.config.seed is not None else -1,
             )
-        choice = response.get("choices", [{}])[0]
-        content = (choice.get("message") or {}).get("content") or choice.get("text") or ""
-        if self.config.strip_reasoning:
-            content = strip_gpt_oss_reasoning(content)
-        return content, response.get("usage", {}), False
+        latency = time.monotonic() - t0
+        choice = (response.get("choices") or [{}])[0]
+        raw_content = (choice.get("message") or {}).get("content") or choice.get("text") or ""
+        if not raw_content:
+            raise RuntimeError("empty response from local llama.cpp model")
+
+        usage = response.get("usage") or {}
+        self._tracker.record(
+            CallRecord(
+                kind="chat",
+                model=_LLAMA_CPP_MODEL_LABEL,
+                prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                completion_tokens=int(usage.get("completion_tokens", 0)),
+                latency_s=latency,
+            )
+        )
+        if use_cache:
+            self._cache_put(key, raw_content)
+
+        content = strip_gpt_oss_reasoning(raw_content) if self.config.strip_reasoning else raw_content
+        return content, {"finish_reason": choice.get("finish_reason", "stop")}, False
 
 
 def check_backend(poc_cfg: POCConfig, timeout: float = 5.0) -> None:

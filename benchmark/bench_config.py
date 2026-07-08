@@ -13,6 +13,10 @@ from typing import Optional, Tuple
 from . import _bootstrap  # noqa: F401 - side effect: proprag_poc on sys.path
 from proprag_poc.config import POCConfig
 
+# Backends POCConfig's preset table actually knows (see proprag_poc/config.py
+# _LLM_PRESETS). "llama_cpp" is a benchmark-only value, not a POC preset.
+_POC_BACKENDS = {"nvidia", "google", "koboldcpp", "ollama", "vllm", "openrouter"}
+
 _DEFAULT_DATASET = os.path.join(
     _bootstrap._PROPRAG_PARENT,
     "PropRAG-main",
@@ -71,10 +75,17 @@ class BenchmarkConfig:
         return os.path.join(self.project_dir, "data")
 
     def make_poc_config(self) -> POCConfig:
-        backend = os.environ.get("PROPRAG_LLM_BACKEND", "koboldcpp")
-        return POCConfig(
+        # POCConfig's preset table only knows nvidia/google/koboldcpp/ollama/vllm/
+        # openrouter; "llama_cpp" (Colab's direct in-process GGUF mode, no HTTP
+        # server) isn't one of them and would KeyError in POCConfig.__post_init__.
+        # Construct with a valid local preset so init succeeds, then relabel -
+        # BenchLLMClient/check_backend both dispatch on poc_cfg.llm_backend ==
+        # "llama_cpp" and never touch the preset's URL/model in that mode.
+        requested = os.environ.get("PROPRAG_LLM_BACKEND", "koboldcpp")
+        construct_backend = requested if requested in _POC_BACKENDS else "koboldcpp"
+        poc_cfg = POCConfig(
             data_dir=self.data_dir,
-            llm_backend=backend,
+            llm_backend=construct_backend,
             temperature=0.0,
             seed=self.seed,
             retrieval_top_k=self.retrieval_top_k,
@@ -82,3 +93,6 @@ class BenchmarkConfig:
             llm_max_workers=1,
             strip_reasoning=True,
         )
+        if requested == "llama_cpp":
+            poc_cfg.llm_backend = "llama_cpp"
+        return poc_cfg
