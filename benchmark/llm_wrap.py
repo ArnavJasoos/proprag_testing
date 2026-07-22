@@ -114,6 +114,34 @@ class BenchLLMClient(LLMClient):
             return content, meta, cache_hit
         return self._infer_direct(messages, *args, **kwargs)
 
+    def unload(self):
+        """Free the GGUF model from VRAM so the embedding model can load next.
+
+        llama-cpp-python releases the model on ``__del__``; drop our reference and
+        force GC + a CUDA cache flush so the freed VRAM is visible to the next
+        phase. No-op for the HTTP (non-direct) backend.
+        """
+        import gc
+
+        llama = getattr(self, "_llama", None)
+        if llama is not None:
+            close = getattr(llama, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._llama = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info("GGUF chat model unloaded; VRAM freed.")
+
     def _infer_direct(
         self,
         messages: List[Dict[str, str]],

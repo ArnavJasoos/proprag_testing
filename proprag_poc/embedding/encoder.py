@@ -1,23 +1,21 @@
-"""Pluggable embedding encoder with an on-disk vector cache, a shared request
-rate limiter, and token-usage instrumentation.
+"""Pluggable embedding encoder with an on-disk vector cache and usage
+instrumentation.
 
-Backends:
-  * ``sentence_transformers`` (default) -> local model (e.g. BAAI/bge-large-en-v1.5),
-    loaded once via HuggingFace ``transformers``. Runs on GPU if available, else
-    CPU. Offline: no rate limit, no token cost, no API key.
-  * ``nvidia`` -> the NVIDIA NeMo Retriever embedding API (OpenAI-compatible), the
-    same online provider the chat LLM can use. nv-embedqa models require an
-    ``input_type`` ("query" vs "passage") sent via ``extra_body``; handled here.
-  * ``openai`` / ``ollama`` -> any OpenAI-compatible embedding server.
+Colab build: the ``sentence_transformers`` backend loads a local HuggingFace
+model (default ``nvidia/NV-Embed-v2``). NV-Embed-v2 is a 7.85B-parameter model
+that does NOT fit a free-tier T4 (15GB) in fp16, so it is loaded in 8-bit via
+``bitsandbytes`` (``PROPRAG_EMBED_8BIT=1``, the default). A CPU fp32 fallback is
+used if the 8-bit load fails. ``unload()`` frees the model from VRAM so the GGUF
+chat model can take the whole GPU in the next phase.
 
-Only the online backends (``nvidia``/``openai``/``ollama`` pointed at a remote
-server) acquire a slot from the shared ``RateLimiter``. All backends report token
-usage + latency to the ``UsageTracker``. Online requests are batched (one HTTP
-request = one rate-limit slot) regardless of how many texts they carry.
+The cache + ``batch_encode`` logic is byte-for-byte identical to the desktop
+version so cache keys (model|input_type|instruction|text) stay stable across
+phases: Phase B fills the cache while embedding; nothing re-encodes later.
 """
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import logging
 import os
@@ -35,6 +33,13 @@ from ..llm.rate_limiter import get_rate_limiter
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "")
+
+
 class EmbeddingModel:
     def __init__(self, config: POCConfig):
         self.config = config
@@ -42,6 +47,10 @@ class EmbeddingModel:
         self._dim: Optional[int] = None
         self._model = None
         self._client = None
+        self._append_eos = False  # NV-Embed-v2 (sentence-transformers path) needs a trailing EOS
+        self._nv_native = False   # NV-Embed-v2 loaded via transformers (its own .encode)
+        self._max_len = 512
+        self._nv_batch = 4
         self._tracker = get_usage_tracker()
         self._limiter = (
             get_rate_limiter(config.rpm_limit) if config.embedding_is_online else None
@@ -54,10 +63,7 @@ class EmbeddingModel:
     # ----------------------------------------------------------------- setup
     def _init_backend(self):
         if self._backend == "sentence_transformers":
-            from sentence_transformers import SentenceTransformer
-
-            self._model = SentenceTransformer(self.config.embedding_model)
-            self._dim = self._model.get_sentence_embedding_dimension()
+            self._load_sentence_transformer()
         elif self._backend in ("nvidia", "ollama", "openai"):
             from openai import OpenAI
 
@@ -71,6 +77,71 @@ class EmbeddingModel:
             )
         else:
             raise ValueError(f"Unknown embedding backend: {self._backend}")
+
+    def _load_sentence_transformer(self):
+        import torch
+
+        name = self.config.embedding_model
+        is_nv_embed = "nv-embed" in name.lower()
+        want_8bit = _env_flag("PROPRAG_EMBED_8BIT", True) and torch.cuda.is_available()
+        self._nv_native = False          # NV-Embed-v2 loaded via transformers (its own .encode)
+        self._max_len = int(os.environ.get("PROPRAG_EMBED_MAX_LEN", "512"))
+        self._nv_batch = int(os.environ.get("PROPRAG_EMBED_BATCH", "4"))
+
+        # Preferred path for NV-Embed-v2 on a T4: load in 8-bit straight through
+        # transformers (device_map handles placement; no SentenceTransformer .to()
+        # which rejects 8-bit models) and use the model's native encode().
+        if is_nv_embed and want_8bit:
+            try:
+                from transformers import AutoModel, BitsAndBytesConfig
+
+                bnb = BitsAndBytesConfig(load_in_8bit=True)
+                logger.info("Loading NV-Embed-v2 in 8-bit (bitsandbytes) via transformers")
+                model = AutoModel.from_pretrained(
+                    name,
+                    trust_remote_code=True,
+                    quantization_config=bnb,
+                    device_map="auto",
+                    torch_dtype=torch.float16,
+                )
+                model.eval()
+                self._model = model
+                self._nv_native = True
+                self._dim = int(getattr(model.config, "hidden_size", 4096))
+                return
+            except Exception as e:  # noqa: BLE001 - fall through to sentence-transformers/CPU
+                logger.warning(
+                    "8-bit NV-Embed load failed (%s); falling back to CPU sentence-transformers.", e
+                )
+
+        from sentence_transformers import SentenceTransformer
+
+        # If 8-bit was wanted but unavailable, use CPU so the (large) model still
+        # fits without competing with the GGUF model for T4 VRAM.
+        device = "cpu" if want_8bit else ("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("Loading embedder %s via sentence-transformers on %s", name, device)
+        model = SentenceTransformer(name, trust_remote_code=True, device=device)
+        if is_nv_embed:
+            model.max_seq_length = self._max_len
+            try:
+                model.tokenizer.padding_side = "right"
+            except Exception:  # noqa: BLE001
+                pass
+            self._append_eos = True
+        self._model = model
+        self._dim = model.get_sentence_embedding_dimension()
+
+    def unload(self):
+        """Free the local model from (V)RAM so the next phase's model can load."""
+        import torch
+
+        self._model = None
+        self._client = None
+        self._dim = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("Embedding model unloaded; VRAM freed.")
 
     def _init_cache(self):
         with sqlite3.connect(self._cache_path) as conn:
@@ -157,16 +228,41 @@ class EmbeddingModel:
 
     def _encode_raw(self, texts: List[str], input_type: str) -> np.ndarray:
         if self._backend == "sentence_transformers":
-            vecs = np.asarray(
-                self._model.encode(
-                    texts,
-                    batch_size=self.config.embedding_batch_size,
-                    normalize_embeddings=False,
-                    show_progress_bar=False,
-                ),
-                dtype=np.float32,
-            )
-            # No API cost, but record the call so per-system counts stay consistent.
+            if self._model is None:
+                raise RuntimeError(
+                    "Embedding model is unloaded but a cache miss occurred. In the "
+                    "3-phase Colab flow every text must be encoded during the "
+                    "embedding phase; a miss here means a text was not pre-encoded."
+                )
+            if self._nv_native:
+                import torch
+
+                out = []
+                bs = max(1, self._nv_batch)
+                for start in range(0, len(texts), bs):
+                    with torch.no_grad():
+                        # NV-Embed-v2's own encode() handles EOS + pooling; the
+                        # per-text instruction is already prepended by batch_encode,
+                        # so pass instruction="" here.
+                        emb = self._model.encode(
+                            texts[start : start + bs], instruction="", max_length=self._max_len
+                        )
+                    out.append(np.asarray(emb.detach().to(torch.float32).cpu().numpy(), dtype=np.float32))
+                vecs = np.vstack(out) if out else np.zeros((0, self.embedding_dim), dtype=np.float32)
+            else:
+                enc_texts = texts
+                if self._append_eos:
+                    eos = self._model.tokenizer.eos_token or ""
+                    enc_texts = [t + eos for t in texts]
+                vecs = np.asarray(
+                    self._model.encode(
+                        enc_texts,
+                        batch_size=self.config.embedding_batch_size,
+                        normalize_embeddings=False,
+                        show_progress_bar=False,
+                    ),
+                    dtype=np.float32,
+                )
             self._tracker.record(
                 CallRecord(
                     kind="embed", model=self.config.embedding_model, batch_size=len(texts)

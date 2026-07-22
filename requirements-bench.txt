@@ -1,0 +1,17 @@
+# Extra deps for the memory-safe local-model benchmark (benchmark.run).
+# Install on top of requirements.txt -- see setup.sh, which also handles the
+# CUDA build of llama-cpp-python (not expressible as a plain requirement).
+
+# NV-Embed-v2 compatibility pins: its remote code breaks on newer transformers,
+# and sentence-transformers must match that transformers version.
+transformers==4.42.4
+sentence-transformers==2.7.0
+
+# 8-bit embedder load (Phase B) + HF device_map placement.
+accelerate>=0.30
+bitsandbytes>=0.43
+einops>=0.7
+
+# NOTE: torch is intentionally NOT pinned here. Use the torch build matching
+# your CUDA runtime (GPU images usually ship one). CPU-only fallback works but
+# is slow: pip install torch

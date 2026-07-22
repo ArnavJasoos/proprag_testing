@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-07-22T06:44:52.119Z",
+  "timestamp": "2026-07-22T09:44:52.324Z",
   "projectRoot": "C:\\Users\\arnav.jade\\Documents\\PropRAG\\PropRAG Testing",
   "structure": {
     "hasPackageJson": false,
@@ -7,5 +7,5 @@
     "hasClaudeConfig": true,
     "hasClaudeFlow": true
   },
-  "scannedAt": 1784702692119
+  "scannedAt": 1784713492325
 }
