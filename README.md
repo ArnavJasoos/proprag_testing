@@ -21,11 +21,12 @@ only measured differences are each system's index and its retrieval strategy.
 | Chat LLM | `gpt-oss-20b-Q4_K_M.gguf` from Hugging Face, via Koboldcpp locally or direct `llama-cpp-python` in Colab |
 | Embeddings | `BAAI/bge-large-en-v1.5` via sentence-transformers (in-process) |
 | Graph | python-igraph (`community_leiden`, no `leidenalg`) |
-| Reused library | `../proprag_poc` (imported, never modified) |
-| Dataset | `../PropRAG-main/reproduce/dataset/2wikimultihopqa{,_corpus}.json` |
+| Reused library | `../proprag_poc` (imported, never modified) — a vendored copy also ships at `proprag_poc/` in this repo for standalone use (e.g. Colab) |
+| Dataset | Desktop: `../PropRAG-main/reproduce/dataset/2wikimultihopqa{,_corpus}.json`. Colab: same files downloaded from HF dataset `osunlp/HippoRAG_2` (cited in `PropRAG-main/reproduce/README.md`) |
 
-The project imports `proprag_poc` as a library; keep this folder as a **sibling** of
-`proprag_poc` under the `PropRAG` directory.
+Locally, keep this folder as a **sibling** of `proprag_poc` under the `PropRAG` directory —
+`benchmark/_bootstrap.py` prefers that canonical copy over the vendored one whenever both
+are present, so local dev always edits the real source.
 
 ## Setup
 
@@ -103,12 +104,27 @@ its local-search context assembly, which the report states explicitly.
 
 ## Colab GGUF mode
 
-The generated notebook sets:
+`PropRAG_Benchmark_Colab.ipynb` is fully self-contained — no Drive mount, no manual
+upload. It clones this repo (vendored `proprag_poc` included), then downloads everything
+else from Hugging Face at run time: the dataset (`osunlp/HippoRAG_2`), the GGUF
+(`unsloth/gpt-oss-20b-GGUF`), and the embedding model (`BAAI/bge-large-en-v1.5`, via
+sentence-transformers as usual). It then sets:
 
 ```bash
 PROPRAG_LLM_BACKEND=llama_cpp
-PROPRAG_GGUF_MODEL_PATH=/content/models/gpt-oss-20b-q4_k_m/gpt-oss-20b-Q4_K_M.gguf
+PROPRAG_GGUF_MODEL_PATH=<hf_hub_download() result>
+PROPRAG_DATASET_PATH=<hf_hub_download() result>
+PROPRAG_CORPUS_PATH=<hf_hub_download() result>
 PROPRAG_LLAMA_N_CTX=4096
 ```
 
-Those defaults are chosen for a free Colab Tesla T4. Increase the context size only if the runtime has enough spare memory.
+`llama_cpp` is a benchmark-only backend value — `BenchmarkConfig.make_poc_config()`
+constructs `POCConfig` with a valid preset (POC doesn't know "llama_cpp") and relabels it
+after init; `BenchLLMClient` then runs `llama_cpp.Llama` in-process instead of using
+`LLMClient`'s HTTP path, with its own SQLite-cache + `UsageTracker` wiring so token
+accounting and resume-on-interrupt still work. `N_CTX=4096` and `N_GPU_LAYERS=-1`
+(all layers offloaded) are chosen for a free Colab T4's 15 GB; lower `N_GPU_LAYERS` if you
+hit a CUDA OOM, raise `N_CTX` if you have more headroom.
+
+Colab's local disk is wiped when the runtime recycles — the notebook's last cell zips the
+latest run's outputs and triggers a browser download.

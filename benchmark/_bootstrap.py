@@ -1,8 +1,12 @@
 """Put the proprag_poc package on sys.path.
 
-Locally, proprag_poc is expected next to this project under the PropRAG folder.
-In Colab, the notebook sets PROPRAG_MAIN to the cloned PropRAG repository and
-this module imports proprag_poc from there.
+Locally, proprag_poc is expected next to this project under the PropRAG folder
+(the canonical, actively-edited copy). A vendored copy also ships inside this
+repo at ``proprag_poc/`` (sibling of ``benchmark/``) so a fresh clone - e.g. in
+Colab, with no sibling checkout available - works standalone. The sibling copy
+takes priority when both exist, so local dev always uses the canonical source.
+
+PROPRAG_MAIN can still override the search entirely if needed.
 """
 
 from __future__ import annotations
@@ -18,7 +22,8 @@ if _env_main:
 
 _here = Path(__file__).resolve()
 _candidates.extend([
-    _here.parents[2],
+    _here.parents[2],   # sibling layout: PropRAG/{proprag_poc, PropRAG Testing}
+    _here.parents[1],   # vendored copy: PropRAG Testing/proprag_poc
     Path("/content/PropRAG_main"),
     Path("/content/PropRAG"),
 ])
